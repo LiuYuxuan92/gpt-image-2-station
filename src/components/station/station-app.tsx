@@ -2,9 +2,15 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import {
+  clearHistoryTasks,
+  loadHistoryTasks,
+  saveHistoryTask,
+} from "@/lib/history-store";
 import type {
   GenerateRequest,
   GenerateResponse,
+  HistoryTask,
   OutputFormat,
   ProbeResult,
   ProbeStatus,
@@ -13,9 +19,10 @@ import type {
   ReferenceImageInput,
   SessionTask,
 } from "@/lib/types";
-import { cn, formatBytes, makeTaskLabel, safeJsonParse } from "@/lib/utils";
+import { cn, formatBytes, makeTaskLabel } from "@/lib/utils";
 
-const HISTORY_KEY = "gpt-image-2-station-history";
+const HISTORY_LIMIT = 50;
+const MAX_REFERENCE_IMAGES = 4;
 const MAX_FILE_SIZE = 8 * 1024 * 1024;
 const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"];
 
@@ -30,15 +37,33 @@ const STYLE_OPTIONS: Array<{ value: PromptStyle; label: string; description: str
 ];
 
 const QUALITY_OPTIONS = ["auto", "low", "medium", "high"];
-const SIZE_OPTIONS = ["1024x1024", "1536x1024", "1024x1536", "auto"];
+const SIZE_OPTIONS = [
+  { value: "1024x1024", label: "1K 方图", description: "1024 x 1024" },
+  { value: "1536x1024", label: "横向 1.5K", description: "1536 x 1024" },
+  { value: "1024x1536", label: "竖向 1.5K", description: "1024 x 1536" },
+  { value: "2048x2048", label: "2K 方图", description: "2048 x 2048" },
+  { value: "3840x2160", label: "4K 横向", description: "3840 x 2160" },
+  { value: "2160x3840", label: "4K 竖向", description: "2160 x 3840" },
+  { value: "custom", label: "自定义", description: "手动输入宽高" },
+  { value: "auto", label: "自动", description: "交给目标接口" },
+];
 const FORMAT_OPTIONS: OutputFormat[] = ["png", "jpeg", "webp"];
 const BACKGROUND_OPTIONS = ["auto", "opaque", "transparent"];
+const GENERATION_STAGES = [
+  "准备请求",
+  "发送到目标接口",
+  "等待上游生成",
+  "拉取/归一化图片",
+  "写入历史",
+];
 
 type ApiError = {
   message?: string;
   code?: string;
   debug?: unknown;
 };
+
+type GenerationStage = (typeof GENERATION_STAGES)[number] | "空闲";
 
 export function StationApp() {
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
@@ -60,31 +85,57 @@ export function StationApp() {
 
   const [quality, setQuality] = useState("auto");
   const [size, setSize] = useState("1024x1024");
+  const [customWidth, setCustomWidth] = useState("2048");
+  const [customHeight, setCustomHeight] = useState("2048");
   const [count, setCount] = useState(1);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("png");
   const [background, setBackground] = useState("auto");
   const [styleHint, setStyleHint] = useState("");
   const [seed, setSeed] = useState("");
+  const [useStreaming, setUseStreaming] = useState(false);
+  const [partialImages, setPartialImages] = useState(2);
 
-  const [referenceImage, setReferenceImage] = useState<ReferenceImageInput | null>(null);
+  const [referenceImages, setReferenceImages] = useState<ReferenceImageInput[]>([]);
+  const [maskImage, setMaskImage] = useState<ReferenceImageInput | null>(null);
   const [uploadError, setUploadError] = useState("");
+  const [streamPreviewImage, setStreamPreviewImage] = useState<string | null>(null);
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState("");
   const [generationWarnings, setGenerationWarnings] = useState<string[]>([]);
   const [lastResult, setLastResult] = useState<GenerateResponse | null>(null);
-  const [history, setHistory] = useState<SessionTask[]>(() => {
-    if (typeof window === "undefined") return [];
-    return safeJsonParse<SessionTask[]>(window.sessionStorage.getItem(HISTORY_KEY) ?? "[]", []);
-  });
+  const [history, setHistory] = useState<HistoryTask[]>([]);
+  const [historyReady, setHistoryReady] = useState(false);
+  const [generationStage, setGenerationStage] = useState<GenerationStage>("空闲");
+  const [generationStartedAt, setGenerationStartedAt] = useState<number | null>(null);
+  const [generationElapsedMs, setGenerationElapsedMs] = useState(0);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
   const [compareSelection, setCompareSelection] = useState<string[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const maskInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    window.sessionStorage.setItem(HISTORY_KEY, JSON.stringify(history));
-  }, [history]);
+    let active = true;
+    loadHistoryTasks(HISTORY_LIMIT)
+      .then((tasks) => {
+        if (active) setHistory(tasks);
+      })
+      .finally(() => {
+        if (active) setHistoryReady(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isGenerating || !generationStartedAt) return;
+    const timer = window.setInterval(() => {
+      setGenerationElapsedMs(Date.now() - generationStartedAt);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [generationStartedAt, isGenerating]);
 
   async function handleProbe() {
     setProbeStatus("testing");
@@ -159,28 +210,69 @@ export function StationApp() {
   }
 
   async function handleReferenceUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    setUploadError("");
+
+    if (!files.length) return;
+    const remainingSlots = MAX_REFERENCE_IMAGES - referenceImages.length;
+    if (remainingSlots <= 0) {
+      setUploadError(`最多支持 ${MAX_REFERENCE_IMAGES} 张参考图。`);
+      event.target.value = "";
+      return;
+    }
+
+    const acceptedFiles = files.slice(0, remainingSlots);
+    const invalid = acceptedFiles.find((file) => !ACCEPTED_IMAGE_TYPES.includes(file.type));
+    if (invalid) {
+      setUploadError("仅支持 PNG、JPEG、WEBP 图片。");
+      event.target.value = "";
+      return;
+    }
+    const oversized = acceptedFiles.find((file) => file.size > MAX_FILE_SIZE);
+    if (oversized) {
+      setUploadError("图片过大，单张限制为 8MB。");
+      event.target.value = "";
+      return;
+    }
+
+    const images = await Promise.all(
+      acceptedFiles.map(async (file) => ({
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        dataUrl: await readFileAsDataUrl(file),
+      })),
+    );
+    setReferenceImages((current) => [...current, ...images].slice(0, MAX_REFERENCE_IMAGES));
+    if (files.length > remainingSlots) {
+      setUploadError(`已加入前 ${remainingSlots} 张，最多支持 ${MAX_REFERENCE_IMAGES} 张参考图。`);
+    }
+    event.target.value = "";
+  }
+
+  async function handleMaskUpload(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     setUploadError("");
 
     if (!file) return;
     if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
-      setUploadError("仅支持 PNG、JPEG、WEBP 图片。");
+      setUploadError("遮罩仅支持 PNG、JPEG、WEBP 图片。");
       event.target.value = "";
       return;
     }
     if (file.size > MAX_FILE_SIZE) {
-      setUploadError("图片过大，MVP 限制为 8MB。");
+      setUploadError("遮罩图片过大，单张限制为 8MB。");
       event.target.value = "";
       return;
     }
 
-    const dataUrl = await readFileAsDataUrl(file);
-    setReferenceImage({
+    setMaskImage({
       name: file.name,
       type: file.type,
       size: file.size,
-      dataUrl,
+      dataUrl: await readFileAsDataUrl(file),
     });
+    event.target.value = "";
   }
 
   async function handleGenerate(promptVariant: "original" | "optimized") {
@@ -190,54 +282,69 @@ export function StationApp() {
       return;
     }
 
+    const finalSize = resolveSelectedSize();
+    if (!finalSize) {
+      setGenerationError("自定义尺寸需要填写有效宽高。");
+      return;
+    }
+
     const model = manualModel.trim() || probeResult?.recommendedModel || "gpt-image-2";
+    const promptSource =
+      promptVariant === "original"
+        ? "original"
+        : optimizedPrompt.trim() === sourcePrompt.trim()
+          ? "optimized"
+          : "manual-edited-optimized";
     const payload: GenerateRequest = {
       baseUrl,
       apiKey,
       model,
       prompt: finalPrompt,
-      promptSource:
-        promptVariant === "original"
-          ? "original"
-          : optimizedPrompt.trim() === sourcePrompt.trim()
-            ? "optimized"
-            : "manual-edited-optimized",
+      promptSource,
       negativePrompt,
-      mode: referenceImage ? "reference" : "text",
+      mode: referenceImages.length ? "reference" : "text",
       quality,
-      size,
+      size: finalSize,
       n: count,
       outputFormat,
       background,
       styleHint,
       seed: seed.trim() ? Number(seed) : null,
-      referenceImage,
+      referenceImage: referenceImages[0] ?? null,
+      referenceImages,
+      maskImage,
+      stream: useStreaming && referenceImages.length === 0,
+      partialImages,
     };
 
     setIsGenerating(true);
+    const startedAt = currentTimeMs();
+    setGenerationStartedAt(startedAt);
+    setGenerationElapsedMs(0);
+    setGenerationStage("准备请求");
     setGenerationError("");
     setGenerationWarnings([]);
+    setStreamPreviewImage(null);
 
     try {
-      const response = await fetch("/api/generate", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-      const result = (await response.json()) as GenerateResponse & ApiError;
-      if (!response.ok || !result.ok) {
+      setGenerationStage(useStreaming && !referenceImages.length ? "等待上游生成" : "发送到目标接口");
+      const result = await requestGeneration(payload);
+      setGenerationStage("拉取/归一化图片");
+      if (!result.ok) {
         throw new Error(result.message ?? "生成失败。");
       }
 
       setLastResult(result);
       setGenerationWarnings(result.warnings);
+      setGenerationStage("写入历史");
 
-      const task: SessionTask = {
+      const durationMs = result.durationMs ?? currentTimeMs() - startedAt;
+      const task: HistoryTask = {
         id: result.taskId,
         createdAt: new Date().toISOString(),
         label: makeTaskLabel(finalPrompt),
+        status: "success",
+        durationMs,
         request: {
           baseUrl: payload.baseUrl,
           model: payload.model,
@@ -252,28 +359,215 @@ export function StationApp() {
           background: payload.background,
           styleHint: payload.styleHint,
           seed: payload.seed,
-          hasReferenceImage: Boolean(referenceImage),
+          stream: payload.stream,
+          partialImages: payload.partialImages,
+          hasReferenceImage: referenceImages.length > 0,
         },
         response: result,
       };
 
-      setHistory((current) => [task, ...current].slice(0, 12));
+      await persistHistoryTask(task);
       setCompareSelection((current) =>
         [result.taskId, ...current].filter((value, index, array) => array.indexOf(value) === index).slice(0, 2),
       );
     } catch (error) {
-      setGenerationError(error instanceof Error ? error.message : "生成失败。");
+      const message = error instanceof Error ? error.message : "生成失败。";
+      setGenerationError(message);
+      const failedTask: HistoryTask = {
+        id: crypto.randomUUID(),
+        createdAt: new Date().toISOString(),
+        label: makeTaskLabel(finalPrompt),
+        status: "error",
+        durationMs: currentTimeMs() - startedAt,
+        errorMessage: message,
+        request: {
+          baseUrl: payload.baseUrl,
+          model: payload.model,
+          prompt: payload.prompt,
+          promptSource: payload.promptSource,
+          negativePrompt: payload.negativePrompt,
+          mode: payload.mode,
+          quality: payload.quality,
+          size: payload.size,
+          n: payload.n,
+          outputFormat: payload.outputFormat,
+          background: payload.background,
+          styleHint: payload.styleHint,
+          seed: payload.seed,
+          stream: payload.stream,
+          partialImages: payload.partialImages,
+          hasReferenceImage: referenceImages.length > 0,
+        },
+      };
+      await persistHistoryTask(failedTask);
     } finally {
       setIsGenerating(false);
+      setGenerationStartedAt(null);
+      setGenerationStage("空闲");
     }
   }
 
-  function removeReferenceImage() {
-    setReferenceImage(null);
+  async function requestGeneration(payload: GenerateRequest): Promise<GenerateResponse & ApiError> {
+    if (payload.stream && payload.mode === "text") {
+      const streamed = await requestStreamingGeneration(payload);
+      if (streamed) return streamed;
+    }
+
+    const response = await fetch("/api/generate", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+    return (await response.json()) as GenerateResponse & ApiError;
+  }
+
+  async function requestStreamingGeneration(payload: GenerateRequest): Promise<(GenerateResponse & ApiError) | null> {
+    const response = await fetch("/api/generate/stream", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!response.ok || !response.body || !contentType.includes("text/event-stream")) {
+      return null;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let completedImage: string | null = null;
+    let durationMs: number | undefined;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\n\n/);
+      buffer = blocks.pop() ?? "";
+
+      for (const block of blocks) {
+        const data = block
+          .split(/\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim())
+          .join("\n");
+        if (!data) continue;
+        const event = safeParseJson(data);
+        if (!event) continue;
+        if (event.type === "partial" && event.dataUrl) {
+          setStreamPreviewImage(event.dataUrl);
+        }
+        if (event.type === "completed" && event.dataUrl) {
+          completedImage = event.dataUrl;
+          durationMs = event.durationMs;
+        }
+        if (event.type === "fallback") {
+          setGenerationWarnings((current) => [...current, event.reason ?? "流式不可用，已回退普通生成。"]);
+          return null;
+        }
+        if (event.type === "error") {
+          throw new Error(event.message ?? "流式生成失败。");
+        }
+      }
+    }
+
+    if (!completedImage) return null;
+    return {
+      ok: true,
+      taskId: crypto.randomUUID(),
+      model: payload.model,
+      mode: payload.mode,
+      prompt: payload.prompt,
+      promptSource: payload.promptSource,
+      negativePrompt: payload.negativePrompt ?? "",
+      parameters: {
+        quality: payload.quality ?? "auto",
+        size: payload.size ?? "1024x1024",
+        n: 1,
+        outputFormat: payload.outputFormat ?? "png",
+        background: payload.background ?? "auto",
+        styleHint: payload.styleHint ?? "none",
+        seed: payload.seed ?? null,
+      },
+      warnings: ["已使用流式预览通道；中转站不支持时会自动回退普通生成。"],
+      images: [
+        {
+          id: crypto.randomUUID(),
+          mimeType: "image/png",
+          source: "b64_json",
+          dataUrl: completedImage,
+        },
+      ],
+      rawResponseShape: "stream",
+      durationMs,
+    };
+  }
+
+  function safeParseJson(data: string): { type?: string; dataUrl?: string; reason?: string; message?: string; durationMs?: number } | null {
+    try {
+      return JSON.parse(data) as { type?: string; dataUrl?: string; reason?: string; message?: string; durationMs?: number };
+    } catch {
+      return null;
+    }
+  }
+
+  function removeReferenceImage(index: number) {
+    setReferenceImages((current) => current.filter((_, itemIndex) => itemIndex !== index));
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
-  const selectedTasks = history.filter((task) => compareSelection.includes(task.id));
+  function clearReferenceImages() {
+    setReferenceImages([]);
+    setMaskImage(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    if (maskInputRef.current) maskInputRef.current.value = "";
+  }
+
+  function sendImageToEdit(image: ReferenceImageInput) {
+    setReferenceImages((current) => [image, ...current].slice(0, MAX_REFERENCE_IMAGES));
+    setLastResult(null);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function createReferenceFromResult(imageUrl: string, title: string): ReferenceImageInput {
+    const mimeType = imageUrl.match(/^data:(.+?);/)?.[1] ?? "image/png";
+    return {
+      name: `${title}.png`,
+      type: mimeType,
+      size: estimateDataUrlBytes(imageUrl),
+      dataUrl: imageUrl,
+    };
+  }
+
+  async function clearHistory() {
+    await clearHistoryTasks();
+    setHistory([]);
+    setCompareSelection([]);
+  }
+
+  async function persistHistoryTask(task: HistoryTask) {
+    setHistory((current) => [task, ...current].slice(0, HISTORY_LIMIT));
+    await saveHistoryTask(task, HISTORY_LIMIT);
+  }
+
+  function resolveSelectedSize() {
+    if (size !== "custom") return size;
+    const width = Number(customWidth);
+    const height = Number(customHeight);
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return null;
+    return `${width}x${height}`;
+  }
+
+  const activeGenerationElapsed = isGenerating ? generationElapsedMs : 0;
+  const currentSize = resolveSelectedSize() ?? "无效尺寸";
+  const selectedTasks = history.filter(
+    (task): task is SessionTask => compareSelection.includes(task.id) && isSuccessfulTask(task),
+  );
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(61,122,102,0.18),_transparent_24%),linear-gradient(180deg,_#f3f5ef_0%,_#e5ebdf_100%)] text-stone-900">
@@ -288,7 +582,7 @@ export function StationApp() {
                 面向 OpenAI 兼容 / 反代 / 中转站的图像生成工作台
               </h1>
               <p className="max-w-3xl text-sm leading-6 text-stone-700 sm:text-base">
-                默认采用后端代理。连接探测、提示词优化、单图参考生成、结果对比和会话级历史都在同一界面完成。
+                默认采用后端代理。连接探测、提示词优化、多图参考、遮罩编辑、流式预览、结果对比和本地历史都在同一界面完成。
               </p>
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -489,8 +783,8 @@ export function StationApp() {
                 <Field label="尺寸">
                   <select value={size} onChange={(event) => setSize(event.target.value)} className={inputClassName}>
                     {SIZE_OPTIONS.map((option) => (
-                      <option key={option} value={option}>
-                        {option}
+                      <option key={option.value} value={option.value}>
+                        {option.label} · {option.description}
                       </option>
                     ))}
                   </select>
@@ -551,61 +845,152 @@ export function StationApp() {
                 </Field>
               </div>
 
+              {size === "custom" ? (
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <Field label="自定义宽度">
+                    <input
+                      type="number"
+                      min={1}
+                      value={customWidth}
+                      onChange={(event) => setCustomWidth(event.target.value)}
+                      className={inputClassName}
+                    />
+                  </Field>
+                  <Field label="自定义高度">
+                    <input
+                      type="number"
+                      min={1}
+                      value={customHeight}
+                      onChange={(event) => setCustomHeight(event.target.value)}
+                      className={inputClassName}
+                    />
+                  </Field>
+                </div>
+              ) : null}
+              <div className="mt-3 rounded-2xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm text-stone-700">
+                当前提交尺寸：<span className="font-medium text-stone-900">{currentSize}</span>
+              </div>
+
+              <div className="mt-3 grid gap-3 rounded-2xl border border-stone-200 bg-stone-50 p-4 sm:grid-cols-[1fr_160px]">
+                <label className="flex items-start gap-3 text-sm text-stone-700">
+                  <input
+                    type="checkbox"
+                    checked={useStreaming}
+                    disabled={referenceImages.length > 0}
+                    onChange={(event) => setUseStreaming(event.target.checked)}
+                    className="mt-1 size-4 rounded border-stone-400"
+                  />
+                  <span>
+                    <span className="block font-medium text-stone-900">尝试流式预览</span>
+                    <span className="mt-1 block leading-5">
+                      仅文生图启用。目标接口不支持 SSE 或 partial images 时自动回退普通生成。
+                    </span>
+                  </span>
+                </label>
+                <Field label="预览张数">
+                  <select
+                    value={partialImages}
+                    disabled={!useStreaming || referenceImages.length > 0}
+                    onChange={(event) => setPartialImages(Number(event.target.value))}
+                    className={inputClassName}
+                  >
+                    {[1, 2, 3].map((value) => (
+                      <option key={value} value={value}>
+                        {value}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+
               <div className="mt-4 rounded-[24px] border border-dashed border-stone-300 bg-stone-50/80 p-4">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <h3 className="text-sm font-medium">单图参考生成 / 优化</h3>
+                    <h3 className="text-sm font-medium">多图参考 / 遮罩编辑</h3>
                     <p className="mt-1 text-sm text-stone-600">
-                      MVP 仅支持单图上传，不支持蒙版编辑。若目标接口不兼容 `/images/edits`，会明确报错。
+                      最多 {MAX_REFERENCE_IMAGES} 张参考图，可附加一张遮罩。目标接口不兼容 `/images/edits` 时会明确报错。
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 transition hover:border-stone-400"
-                  >
-                    {referenceImage ? "替换图片" : "上传参考图"}
-                  </button>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 transition hover:border-stone-400"
+                    >
+                      上传参考图
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => maskInputRef.current?.click()}
+                      disabled={!referenceImages.length}
+                      className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 transition hover:border-stone-400 disabled:cursor-not-allowed disabled:text-stone-400"
+                    >
+                      上传遮罩
+                    </button>
+                    {referenceImages.length || maskImage ? (
+                      <button
+                        type="button"
+                        onClick={clearReferenceImages}
+                        className="rounded-full border border-rose-200 bg-rose-50 px-4 py-2 text-sm font-medium text-rose-700"
+                      >
+                        清空
+                      </button>
+                    ) : null}
+                  </div>
                   <input
                     ref={fileInputRef}
                     type="file"
+                    multiple
                     accept={ACCEPTED_IMAGE_TYPES.join(",")}
                     className="hidden"
                     onChange={handleReferenceUpload}
                   />
+                  <input
+                    ref={maskInputRef}
+                    type="file"
+                    accept={ACCEPTED_IMAGE_TYPES.join(",")}
+                    className="hidden"
+                    onChange={handleMaskUpload}
+                  />
                 </div>
 
-                {referenceImage ? (
-                  <div className="mt-4 grid gap-4 sm:grid-cols-[140px_1fr]">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={referenceImage.dataUrl}
-                      alt={referenceImage.name}
-                      className="aspect-square w-full rounded-2xl object-cover shadow-sm"
-                    />
-                    <div className="space-y-2">
-                      <p className="text-sm font-medium text-stone-800">{referenceImage.name}</p>
-                      <p className="text-sm text-stone-600">
-                        {referenceImage.type} · {formatBytes(referenceImage.size)}
-                      </p>
-                      <div className="flex gap-2">
-                        <button
-                          type="button"
-                          onClick={() => setPreviewImage(referenceImage.dataUrl)}
-                          className="rounded-full bg-stone-900 px-4 py-2 text-sm font-medium text-white"
-                        >
-                          查看大图
-                        </button>
-                        <button
-                          type="button"
-                          onClick={removeReferenceImage}
-                          className="rounded-full border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700"
-                        >
-                          删除
-                        </button>
-                      </div>
+                {referenceImages.length ? (
+                  <>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      {referenceImages.map((image, index) => (
+                        <ImageInputCard
+                          key={`${image.name}-${index}`}
+                          image={image}
+                          badge={`参考 ${index + 1}`}
+                          onPreview={() => setPreviewImage(image.dataUrl)}
+                          onRemove={() => removeReferenceImage(index)}
+                        />
+                      ))}
+                      {maskImage ? (
+                        <ImageInputCard
+                          image={maskImage}
+                          badge="遮罩"
+                          onPreview={() => setPreviewImage(maskImage.dataUrl)}
+                          onRemove={() => setMaskImage(null)}
+                        />
+                      ) : (
+                        <div className="rounded-2xl border border-dashed border-stone-300 bg-white px-4 py-5 text-sm leading-6 text-stone-600">
+                          遮罩可选。上传后会作为 multipart 的 <span className="font-medium">mask</span> 字段发送，尺寸是否需要完全一致取决于目标接口。
+                        </div>
+                      )}
                     </div>
-                  </div>
+                    <MaskPainter
+                      baseImage={referenceImages[0]}
+                      onApplyMask={(dataUrl) =>
+                        setMaskImage({
+                          name: "mask.png",
+                          type: "image/png",
+                          size: estimateDataUrlBytes(dataUrl),
+                          dataUrl,
+                        })
+                      }
+                    />
+                  </>
                 ) : (
                   <div className="mt-4 rounded-2xl bg-white px-4 py-5 text-sm text-stone-600">
                     未上传参考图时，将走文生图流程。上传后默认切换为“参考图生成 / 优化”模式。
@@ -635,6 +1020,13 @@ export function StationApp() {
               </div>
 
               {generationError ? <ErrorNotice message={generationError} /> : null}
+              {isGenerating ? (
+                <GenerationProgress
+                  stage={generationStage}
+                  elapsedMs={activeGenerationElapsed}
+                  previewImage={streamPreviewImage}
+                />
+              ) : null}
               {generationWarnings.length ? (
                 <NoticeList title="生成提示" items={generationWarnings} tone="sky" />
               ) : null}
@@ -649,6 +1041,8 @@ export function StationApp() {
                     <Pill label={`数量 ${lastResult.parameters.n}`} />
                     <Pill label={`尺寸 ${lastResult.parameters.size}`} />
                     <Pill label={`质量 ${lastResult.parameters.quality}`} />
+                    {lastResult.durationMs ? <Pill label={`耗时 ${formatDuration(lastResult.durationMs)}`} /> : null}
+                    {lastResult.usage?.totalTokens ? <Pill label={`Tokens ${lastResult.usage.totalTokens}`} /> : null}
                   </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     {lastResult.images.map((image, index) => (
@@ -658,9 +1052,27 @@ export function StationApp() {
                         subtitle={lastResult.promptSource}
                         imageUrl={image.dataUrl}
                         onPreview={() => setPreviewImage(image.dataUrl)}
+                        onSendToEdit={() =>
+                          sendImageToEdit(createReferenceFromResult(image.dataUrl, `结果 ${index + 1}`))
+                        }
                       />
                     ))}
                   </div>
+                  {lastResult.usage || typeof lastResult.estimatedCostUsd === "number" ? (
+                    <div className="grid gap-3 rounded-2xl border border-stone-200 bg-stone-50 px-4 py-4 text-sm text-stone-700 sm:grid-cols-4">
+                      <Metric label="输入 Tokens" value={lastResult.usage?.promptTokens ?? "-"} />
+                      <Metric label="输出 Tokens" value={lastResult.usage?.outputTokens ?? "-"} />
+                      <Metric label="总 Tokens" value={lastResult.usage?.totalTokens ?? "-"} />
+                      <Metric
+                        label="费用估算"
+                        value={
+                          typeof lastResult.estimatedCostUsd === "number"
+                            ? `$${lastResult.estimatedCostUsd.toFixed(4)}`
+                            : "上游未返回"
+                        }
+                      />
+                    </div>
+                  ) : null}
                   <div className="rounded-2xl border border-stone-200 bg-stone-50 px-4 py-4 text-sm text-stone-700">
                     <p className="font-medium text-stone-800">实际使用提示词</p>
                     <p className="mt-2 whitespace-pre-wrap leading-6">{lastResult.prompt}</p>
@@ -683,19 +1095,40 @@ export function StationApp() {
         </main>
 
         <section className="mt-4 grid gap-4 xl:grid-cols-[0.84fr_1.16fr]">
-          <Panel title="会话历史 / 任务区" subtitle="当前浏览器会话内保留最近 12 个任务。">
+          <Panel
+            title="历史 / 任务区"
+            subtitle={`IndexedDB 保存最近 ${HISTORY_LIMIT} 个成功或失败任务，不保存 API Key。`}
+            aside={
+              history.length ? (
+                <button
+                  type="button"
+                  onClick={clearHistory}
+                  className="rounded-full border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 transition hover:bg-white"
+                >
+                  清空历史
+                </button>
+              ) : null
+            }
+          >
             {history.length ? (
               <div className="space-y-3">
                 {history.map((task) => {
                   const checked = compareSelection.includes(task.id);
+                  const isError = task.status === "error";
                   return (
                     <label
                       key={task.id}
-                      className="flex cursor-pointer gap-3 rounded-2xl border border-stone-200 bg-stone-50 px-4 py-4 transition hover:bg-white"
+                      className={cn(
+                        "flex gap-3 rounded-2xl border px-4 py-4 transition",
+                        isError
+                          ? "border-rose-200 bg-rose-50"
+                          : "cursor-pointer border-stone-200 bg-stone-50 hover:bg-white",
+                      )}
                     >
                       <input
                         type="checkbox"
                         checked={checked}
+                        disabled={isError}
                         onChange={(event) => {
                           setCompareSelection((current) => {
                             if (event.target.checked) return [task.id, ...current].slice(0, 2);
@@ -707,22 +1140,28 @@ export function StationApp() {
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <p className="truncate text-sm font-medium text-stone-900">{task.label}</p>
+                          <Pill label={isError ? "失败" : "成功"} />
                           <Pill label={task.request.mode === "reference" ? "图生图" : "文生图"} />
                           <Pill label={task.request.promptSource} />
+                          {task.durationMs ? <Pill label={formatDuration(task.durationMs)} /> : null}
                         </div>
                         <p className="mt-1 text-xs text-stone-500">
                           {new Date(task.createdAt).toLocaleString()}
                         </p>
-                        <p className="mt-2 line-clamp-2 text-sm text-stone-700">{task.response.prompt}</p>
+                        <p className="mt-2 line-clamp-2 text-sm text-stone-700">
+                          {isError ? task.errorMessage : task.response.prompt}
+                        </p>
                       </div>
                     </label>
                   );
                 })}
               </div>
+            ) : !historyReady ? (
+              <EmptyState title="正在读取历史" description="正在从浏览器 IndexedDB 加载最近任务。" />
             ) : (
               <EmptyState
                 title="暂无历史任务"
-                description="成功生成后，会把任务快照保存在浏览器会话中，不会落库。"
+                description="生成成功或失败后，会把任务快照保存在浏览器 IndexedDB 中，不会保存 API Key。"
               />
             )}
           </Panel>
@@ -740,19 +1179,28 @@ export function StationApp() {
                     <p className="mt-2 text-sm leading-6 text-stone-700">{task.response.prompt}</p>
                     <div className="mt-4 flex snap-x gap-3 overflow-x-auto pb-1">
                       {task.response.images.map((image, index) => (
-                        <button
+                        <div
                           key={image.id}
-                          type="button"
-                          onClick={() => setPreviewImage(image.dataUrl)}
                           className="min-w-[220px] snap-start overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-sm"
                         >
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img
-                            src={image.dataUrl}
-                            alt={`${task.label}-${index + 1}`}
-                            className="aspect-square w-full object-cover"
-                          />
-                        </button>
+                          <button type="button" onClick={() => setPreviewImage(image.dataUrl)}>
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={image.dataUrl}
+                              alt={`${task.label}-${index + 1}`}
+                              className="aspect-square w-full object-cover"
+                            />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              sendImageToEdit(createReferenceFromResult(image.dataUrl, `${task.label}-${index + 1}`))
+                            }
+                            className="w-full border-t border-stone-200 px-3 py-2 text-xs font-medium text-stone-700"
+                          >
+                            发送到编辑
+                          </button>
+                        </div>
                       ))}
                     </div>
                   </div>
@@ -879,16 +1327,252 @@ function EmptyState({ title, description }: { title: string; description: string
   );
 }
 
+function GenerationProgress({
+  stage,
+  elapsedMs,
+  previewImage,
+}: {
+  stage: GenerationStage;
+  elapsedMs: number;
+  previewImage: string | null;
+}) {
+  return (
+    <div className="mt-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-4 text-sm text-emerald-950">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="font-medium">生成状态：{stage}</p>
+        <p>{formatDuration(elapsedMs)}</p>
+      </div>
+      <div className="mt-3 grid gap-2 sm:grid-cols-5">
+        {GENERATION_STAGES.map((item) => (
+          <div
+            key={item}
+            className={cn(
+              "h-2 rounded-full",
+              item === stage ? "bg-emerald-800" : "bg-emerald-200",
+            )}
+          />
+        ))}
+      </div>
+      <p className="mt-3 text-xs leading-5 text-emerald-900/75">
+        图片生成和远程 URL 拉取最长等待 10 分钟；页面保持打开即可等待结果。
+      </p>
+      {previewImage ? (
+        <div className="mt-3 overflow-hidden rounded-2xl border border-emerald-200 bg-white">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={previewImage} alt="stream preview" className="max-h-[280px] w-full object-contain" />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ImageInputCard({
+  image,
+  badge,
+  onPreview,
+  onRemove,
+}: {
+  image: ReferenceImageInput;
+  badge: string;
+  onPreview: () => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="grid grid-cols-[104px_1fr] gap-3 rounded-2xl border border-stone-200 bg-white p-3">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={image.dataUrl} alt={image.name} className="aspect-square rounded-xl object-cover" />
+      <div className="min-w-0 space-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Pill label={badge} />
+          <p className="truncate text-sm font-medium text-stone-800">{image.name}</p>
+        </div>
+        <p className="text-xs text-stone-600">
+          {image.type} · {formatBytes(image.size)}
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={onPreview}
+            className="rounded-full bg-stone-900 px-3 py-2 text-xs font-medium text-white"
+          >
+            查看
+          </button>
+          <button
+            type="button"
+            onClick={onRemove}
+            className="rounded-full border border-stone-300 px-3 py-2 text-xs font-medium text-stone-700"
+          >
+            删除
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MaskPainter({
+  baseImage,
+  onApplyMask,
+}: {
+  baseImage: ReferenceImageInput;
+  onApplyMask: (dataUrl: string) => void;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const [brushSize, setBrushSize] = useState(42);
+  const [mode, setMode] = useState<"paint" | "erase">("paint");
+  const [isDrawing, setIsDrawing] = useState(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "black";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+  }, [baseImage.dataUrl]);
+
+  function drawAt(event: React.PointerEvent<HTMLCanvasElement>) {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const x = (event.clientX - rect.left) * scaleX;
+    const y = (event.clientY - rect.top) * scaleY;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.globalCompositeOperation = "source-over";
+    context.fillStyle = mode === "paint" ? "white" : "black";
+    context.beginPath();
+    context.arc(x, y, brushSize, 0, Math.PI * 2);
+    context.fill();
+  }
+
+  function clearMask() {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    context.fillStyle = "black";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  function applyMask() {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    onApplyMask(canvas.toDataURL("image/png"));
+  }
+
+  return (
+    <div className="mt-4 rounded-2xl border border-stone-200 bg-white p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h4 className="text-sm font-medium text-stone-900">遮罩画笔</h4>
+          <p className="mt-1 text-xs leading-5 text-stone-600">
+            白色区域表示要编辑的位置，黑色区域保留。基于第一张参考图尺寸导出 PNG。
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setMode("paint")}
+            className={cn(
+              "rounded-full px-3 py-2 text-xs font-medium",
+              mode === "paint" ? "bg-stone-900 text-white" : "border border-stone-300 text-stone-700",
+            )}
+          >
+            画白
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("erase")}
+            className={cn(
+              "rounded-full px-3 py-2 text-xs font-medium",
+              mode === "erase" ? "bg-stone-900 text-white" : "border border-stone-300 text-stone-700",
+            )}
+          >
+            擦黑
+          </button>
+          <button
+            type="button"
+            onClick={clearMask}
+            className="rounded-full border border-stone-300 px-3 py-2 text-xs font-medium text-stone-700"
+          >
+            清空
+          </button>
+          <button
+            type="button"
+            onClick={applyMask}
+            className="rounded-full bg-emerald-900 px-3 py-2 text-xs font-medium text-white"
+          >
+            应用遮罩
+          </button>
+        </div>
+      </div>
+
+      <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_160px]">
+        <div className="relative overflow-hidden rounded-2xl border border-stone-200 bg-stone-100">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            ref={imageRef}
+            src={baseImage.dataUrl}
+            alt={baseImage.name}
+            className="absolute inset-0 size-full object-contain opacity-45"
+          />
+          <canvas
+            ref={canvasRef}
+            width={1024}
+            height={1024}
+            className="relative z-10 aspect-square w-full touch-none mix-blend-screen"
+            onPointerDown={(event) => {
+              setIsDrawing(true);
+              event.currentTarget.setPointerCapture(event.pointerId);
+              drawAt(event);
+            }}
+            onPointerMove={(event) => {
+              if (isDrawing) drawAt(event);
+            }}
+            onPointerUp={() => setIsDrawing(false)}
+            onPointerCancel={() => setIsDrawing(false)}
+          />
+        </div>
+        <Field label={`画笔 ${brushSize}px`}>
+          <input
+            type="range"
+            min={8}
+            max={120}
+            value={brushSize}
+            onChange={(event) => setBrushSize(Number(event.target.value))}
+            className="w-full accent-emerald-900"
+          />
+        </Field>
+      </div>
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div>
+      <p className="text-xs uppercase tracking-[0.12em] text-stone-500">{label}</p>
+      <p className="mt-1 font-medium text-stone-900">{value}</p>
+    </div>
+  );
+}
+
 function ResultCard({
   title,
   subtitle,
   imageUrl,
   onPreview,
+  onSendToEdit,
 }: {
   title: string;
   subtitle: string;
   imageUrl: string;
   onPreview: () => void;
+  onSendToEdit: () => void;
 }) {
   return (
     <div className="overflow-hidden rounded-[26px] border border-stone-200 bg-stone-50 shadow-sm">
@@ -906,6 +1590,13 @@ function ResultCard({
             className="rounded-full border border-stone-300 px-3 py-2 text-xs font-medium text-stone-700"
           >
             放大
+          </button>
+          <button
+            type="button"
+            onClick={onSendToEdit}
+            className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-medium text-emerald-800"
+          >
+            编辑
           </button>
           <a
             href={imageUrl}
@@ -935,6 +1626,30 @@ function readFileAsDataUrl(file: File) {
     reader.onerror = () => reject(new Error("读取图片失败。"));
     reader.readAsDataURL(file);
   });
+}
+
+function estimateDataUrlBytes(dataUrl: string) {
+  const base64 = dataUrl.split(",")[1] ?? "";
+  if (!base64) return 0;
+  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((base64.length * 3) / 4) - padding);
+}
+
+function formatDuration(ms: number) {
+  const safeMs = Math.max(0, ms);
+  const totalSeconds = Math.floor(safeMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes > 0) return `${minutes}分${seconds.toString().padStart(2, "0")}秒`;
+  return `${seconds}秒`;
+}
+
+function currentTimeMs() {
+  return new Date().getTime();
+}
+
+function isSuccessfulTask(task: HistoryTask): task is SessionTask {
+  return task.status !== "error";
 }
 
 const inputClassName =

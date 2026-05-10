@@ -64,7 +64,10 @@ Why this stack:
   - Rule rewrite plus optional AI rewrite
 
 - `src/app/api/generate/route.ts`
-  - Text-to-image and single-reference image generation
+  - Text-to-image, multi-reference image generation, optional mask forwarding
+
+- `src/app/api/generate/stream/route.ts`
+  - SSE proxy for optional streaming image previews with graceful fallback
 
 ## Frontend modules
 
@@ -80,9 +83,9 @@ Why this stack:
 3. Server validates the URL and probes `/models`, then returns normalized capabilities plus actionable warnings.
 4. User writes a prompt and optionally runs optimization.
 5. Client posts optimization data to `/api/prompt/optimize`.
-6. User submits generation request to `/api/generate`.
-7. Server sends either image generation or edit-style multipart request and normalizes output into a single gallery format.
-8. Client stores the task snapshot in `sessionStorage`.
+6. User submits generation request to `/api/generate` or optional `/api/generate/stream`.
+7. Server sends either image generation, streaming image generation, or edit-style multipart request and normalizes output into a single gallery format.
+8. Client stores the task snapshot in IndexedDB without API keys or uploaded image data.
 
 ## MVP scope
 
@@ -92,15 +95,15 @@ Why this stack:
   - Rule-based prompt optimization
   - Optional AI rewrite through the probed endpoint
   - Text-to-image
-  - Single reference image flow
+  - Optional streaming preview for text-to-image
+  - Multi-reference image flow
+  - Mask upload and lightweight mask painter
   - Comparison-ready result gallery
-  - Session-level history
+  - IndexedDB history
   - Mobile-adaptive layout
   - User-readable error states
 
 - Deferred:
-  - Mask editing
-  - Persistent task storage
   - Background queueing
   - Multi-user auth
   - Advanced workflow presets

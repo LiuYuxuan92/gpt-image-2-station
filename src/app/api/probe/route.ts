@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 
-import { probeOpenAICompat, UserFacingError } from "@/lib/openai-compat";
+import {
+  internalErrorResponse,
+  isUserFacingErrorLike,
+  userFacingErrorResponse,
+} from "@/lib/api-errors";
+import { probeOpenAICompat } from "@/lib/openai-compat";
 
 type ProbePayload = {
   baseUrl?: string;
@@ -19,25 +24,10 @@ export async function POST(request: Request) {
 
     return NextResponse.json(result);
   } catch (error) {
-    if (error instanceof UserFacingError) {
-      return NextResponse.json(
-        {
-          ok: false,
-          code: error.code,
-          message: error.message,
-          debug: error.debug ?? null,
-        },
-        { status: error.status },
-      );
+    if (isUserFacingErrorLike(error)) {
+      return userFacingErrorResponse(error);
     }
 
-    return NextResponse.json(
-      {
-        ok: false,
-        code: "internal_error",
-        message: "探测过程中出现未处理错误。",
-      },
-      { status: 500 },
-    );
+    return internalErrorResponse("探测过程中出现未处理错误。", error);
   }
 }

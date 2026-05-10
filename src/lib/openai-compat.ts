@@ -1,12 +1,16 @@
 import type {
   GenerateRequest,
   GenerateResponse,
+  GenerateUsage,
   GeneratedImage,
   ProbeResult,
   ReferenceImageInput,
 } from "@/lib/types";
 
-const REQUEST_TIMEOUT_MS = 25_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 25_000;
+const TEXT_REWRITE_TIMEOUT_MS = 60_000;
+const IMAGE_GENERATION_TIMEOUT_MS = 600_000;
+const IMAGE_FETCH_TIMEOUT_MS = 600_000;
 const PRIVATE_HOST_PATTERNS = [
   /^localhost$/i,
   /^127\./,
@@ -68,37 +72,43 @@ export function normalizeBaseUrl(input: string) {
   return url.toString().replace(/\/$/, "");
 }
 
-function createAbortController() {
+function createAbortController(timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   return {
     signal: controller.signal,
     cleanup: () => clearTimeout(timeout),
   };
 }
 
+type CompatFetchInit = RequestInit & {
+  skipJsonContentType?: boolean;
+  timeoutMs?: number;
+};
+
 async function compatFetch(
   url: string,
   apiKey: string,
-  init?: RequestInit & { skipJsonContentType?: boolean },
+  init?: CompatFetchInit,
 ) {
-  const { signal, cleanup } = createAbortController();
+  const { skipJsonContentType, timeoutMs, ...fetchInit } = init ?? {};
+  const { signal, cleanup } = createAbortController(timeoutMs);
   try {
-    const headers = new Headers(init?.headers);
+    const headers = new Headers(fetchInit.headers);
     headers.set("Authorization", `Bearer ${apiKey.trim()}`);
-    if (!init?.skipJsonContentType && !headers.has("Content-Type")) {
+    if (!skipJsonContentType && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
 
     return await fetch(url, {
-      ...init,
+      ...fetchInit,
       headers,
       signal,
       cache: "no-store",
     });
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new UserFacingError("请求超时，目标接口未在限定时间内响应。", {
+      throw new UserFacingError(`请求超时，目标接口未在 ${Math.round((timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS) / 1000)} 秒内响应。`, {
         code: "upstream_timeout",
         status: 504,
       });
@@ -268,6 +278,7 @@ export async function rewritePromptWithTextModel(input: {
       const response = await compatFetch(endpoint, input.apiKey, {
         method: "POST",
         body: JSON.stringify(body),
+        timeoutMs: TEXT_REWRITE_TIMEOUT_MS,
       });
 
       if (!response.ok) {
@@ -346,8 +357,17 @@ function decodeDataUrl(input: ReferenceImageInput) {
   return Buffer.from(match[2], "base64");
 }
 
+function getReferenceImages(input: GenerateRequest) {
+  const images = input.referenceImages?.length
+    ? input.referenceImages
+    : input.referenceImage
+      ? [input.referenceImage]
+      : [];
+  return images.filter((image) => Boolean(image?.dataUrl));
+}
+
 async function fetchRemoteImageAsDataUrl(url: string) {
-  const { signal, cleanup } = createAbortController();
+  const { signal, cleanup } = createAbortController(IMAGE_FETCH_TIMEOUT_MS);
   try {
     const response = await fetch(url, {
       signal,
@@ -435,7 +455,34 @@ async function normalizeImageList(payload: unknown): Promise<{ images: Generated
   };
 }
 
+function readNumberField(source: unknown, keys: string[]) {
+  if (!source || typeof source !== "object") return undefined;
+  for (const key of keys) {
+    const value = (source as Record<string, unknown>)[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function extractUsage(payload: unknown): GenerateUsage | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const usage = (payload as { usage?: unknown }).usage;
+  if (!usage || typeof usage !== "object") return undefined;
+
+  const promptTokens = readNumberField(usage, ["prompt_tokens", "input_tokens", "promptTokens"]);
+  const outputTokens = readNumberField(usage, ["output_tokens", "completion_tokens", "outputTokens"]);
+  const totalTokens = readNumberField(usage, ["total_tokens", "totalTokens"]);
+  const result: GenerateUsage = {};
+
+  if (promptTokens !== undefined) result.promptTokens = promptTokens;
+  if (outputTokens !== undefined) result.outputTokens = outputTokens;
+  if (totalTokens !== undefined) result.totalTokens = totalTokens;
+
+  return Object.keys(result).length ? result : undefined;
+}
+
 export async function generateImages(input: GenerateRequest): Promise<GenerateResponse> {
+  const startedAt = Date.now();
   const normalizedBaseUrl = normalizeBaseUrl(input.baseUrl);
   if (!input.apiKey.trim()) {
     throw new UserFacingError("API Key 不能为空。", {
@@ -455,8 +502,9 @@ export async function generateImages(input: GenerateRequest): Promise<GenerateRe
 
   const warnings: string[] = [];
   let response: Response;
+  const referenceImages = getReferenceImages(input);
 
-  if (input.mode === "reference" && input.referenceImage) {
+  if (input.mode === "reference" && referenceImages.length) {
     const formData = new FormData();
     formData.set("model", input.model);
     formData.set("prompt", input.prompt);
@@ -469,18 +517,30 @@ export async function generateImages(input: GenerateRequest): Promise<GenerateRe
     if (input.negativePrompt) formData.set("negative_prompt", input.negativePrompt);
     if (typeof input.seed === "number") formData.set("seed", String(input.seed));
 
-    const imageBuffer = decodeDataUrl(input.referenceImage);
-    formData.set(
-      "image",
-      new Blob([imageBuffer], { type: input.referenceImage.type }),
-      input.referenceImage.name,
-    );
+    for (const image of referenceImages) {
+      const imageBuffer = decodeDataUrl(image);
+      formData.append(
+        "image",
+        new Blob([imageBuffer], { type: image.type }),
+        image.name,
+      );
+    }
+
+    if (input.maskImage) {
+      const maskBuffer = decodeDataUrl(input.maskImage);
+      formData.append(
+        "mask",
+        new Blob([maskBuffer], { type: input.maskImage.type }),
+        input.maskImage.name,
+      );
+    }
 
     response = await compatFetch(`${normalizedBaseUrl}/images/edits`, input.apiKey, {
       method: "POST",
       body: formData,
       headers: {},
       skipJsonContentType: true,
+      timeoutMs: IMAGE_GENERATION_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -512,6 +572,7 @@ export async function generateImages(input: GenerateRequest): Promise<GenerateRe
     response = await compatFetch(`${normalizedBaseUrl}/images/generations`, input.apiKey, {
       method: "POST",
       body: JSON.stringify(payload),
+      timeoutMs: IMAGE_GENERATION_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -521,6 +582,7 @@ export async function generateImages(input: GenerateRequest): Promise<GenerateRe
 
   const payload = (await response.json()) as unknown;
   const normalized = await normalizeImageList(payload);
+  const usage = extractUsage(payload);
 
   if (input.mode === "reference") {
     warnings.push("参考图模式按 OpenAI 风格编辑接口发送，实际效果取决于目标服务兼容性。");
@@ -550,6 +612,9 @@ export async function generateImages(input: GenerateRequest): Promise<GenerateRe
     warnings,
     images: normalized.images,
     rawResponseShape: normalized.rawResponseShape,
+    durationMs: Date.now() - startedAt,
+    usage,
+    estimatedCostUsd: undefined,
   };
 }
 

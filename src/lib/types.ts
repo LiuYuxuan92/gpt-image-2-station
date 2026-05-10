@@ -87,7 +87,11 @@ export type GenerateRequest = {
   background?: string;
   styleHint?: string;
   seed?: number | null;
+  referenceImages?: ReferenceImageInput[];
   referenceImage?: ReferenceImageInput | null;
+  maskImage?: ReferenceImageInput | null;
+  stream?: boolean;
+  partialImages?: number;
 };
 
 export type GeneratedImage = {
@@ -95,6 +99,12 @@ export type GeneratedImage = {
   mimeType: string;
   source: "b64_json" | "url";
   dataUrl: string;
+};
+
+export type GenerateUsage = {
+  promptTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
 };
 
 export type GenerateResponse = {
@@ -117,14 +127,30 @@ export type GenerateResponse = {
   warnings: string[];
   images: GeneratedImage[];
   rawResponseShape: string;
+  durationMs?: number;
+  usage?: GenerateUsage;
+  estimatedCostUsd?: number;
 };
+
+export type SessionTaskStatus = "success" | "error";
 
 export type SessionTask = {
   id: string;
   createdAt: string;
   label: string;
-  request: Omit<GenerateRequest, "apiKey" | "referenceImage"> & {
+  status?: SessionTaskStatus;
+  durationMs?: number;
+  errorMessage?: string;
+  request: Omit<GenerateRequest, "apiKey" | "referenceImage" | "referenceImages" | "maskImage"> & {
     hasReferenceImage: boolean;
   };
   response: GenerateResponse;
 };
+
+export type FailedSessionTask = Omit<SessionTask, "response" | "status"> & {
+  status: "error";
+  errorMessage: string;
+  response?: never;
+};
+
+export type HistoryTask = SessionTask | FailedSessionTask;
