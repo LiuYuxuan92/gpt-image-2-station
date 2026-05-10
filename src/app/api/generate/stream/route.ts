@@ -6,6 +6,12 @@ import {
   userFacingErrorResponse,
 } from "@/lib/api-errors";
 import { generateImages, normalizeBaseUrl } from "@/lib/openai-compat";
+import {
+  createRequestId,
+  logGenerationEvent,
+  summarizeDebug,
+  summarizeGenerateRequest,
+} from "@/lib/server-logger";
 import type { GenerateRequest } from "@/lib/types";
 
 const STREAM_TIMEOUT_MS = 600_000;
@@ -18,10 +24,31 @@ type StreamEvent =
   | { type: "error"; message: string };
 
 export async function POST(request: Request) {
+  const requestId = createRequestId();
+  const outerStartedAt = Date.now();
+  let body: GenerateRequest | null = null;
+
   try {
-    const body = (await request.json()) as GenerateRequest;
-    if (body.mode === "reference" || body.referenceImages?.length || body.referenceImage || body.maskImage) {
-      const result = await generateImages(body);
+    body = (await request.json()) as GenerateRequest;
+    const streamBody = body;
+    await logGenerationEvent({
+      event: "generate_start",
+      route: "/api/generate/stream",
+      requestId,
+      timestamp: new Date().toISOString(),
+      request: summarizeGenerateRequest(body),
+    });
+
+    if (streamBody.mode === "reference" || streamBody.referenceImages?.length || streamBody.referenceImage || streamBody.maskImage) {
+      const result = await generateImages(streamBody);
+      await logGenerationEvent({
+        event: "generate_success",
+        route: "/api/generate/stream",
+        requestId,
+        timestamp: new Date().toISOString(),
+        durationMs: Date.now() - outerStartedAt,
+        request: summarizeGenerateRequest(streamBody),
+      });
       return NextResponse.json(result);
     }
 
@@ -39,26 +66,26 @@ export async function POST(request: Request) {
 
         try {
           send({ type: "status", message: "正在请求上游流式生图接口。" });
-          const normalizedBaseUrl = normalizeBaseUrl(body.baseUrl);
+          const normalizedBaseUrl = normalizeBaseUrl(streamBody.baseUrl);
           const upstreamPayload = {
-            model: body.model,
-            prompt: body.prompt,
-            n: body.n ?? 1,
-            size: body.size ?? "1024x1024",
-            quality: body.quality ?? "auto",
-            background: body.background ?? "auto",
-            output_format: body.outputFormat ?? "png",
+            model: streamBody.model,
+            prompt: streamBody.prompt,
+            n: streamBody.n ?? 1,
+            size: streamBody.size ?? "1024x1024",
+            quality: streamBody.quality ?? "auto",
+            background: streamBody.background ?? "auto",
+            output_format: streamBody.outputFormat ?? "png",
             stream: true,
-            partial_images: Math.min(Math.max(body.partialImages ?? 2, 1), 3),
-            ...(body.styleHint ? { style: body.styleHint } : {}),
-            ...(body.negativePrompt ? { negative_prompt: body.negativePrompt } : {}),
-            ...(typeof body.seed === "number" ? { seed: body.seed } : {}),
+            partial_images: Math.min(Math.max(streamBody.partialImages ?? 2, 1), 3),
+            ...(streamBody.styleHint ? { style: streamBody.styleHint } : {}),
+            ...(streamBody.negativePrompt ? { negative_prompt: streamBody.negativePrompt } : {}),
+            ...(typeof streamBody.seed === "number" ? { seed: streamBody.seed } : {}),
           };
 
           const response = await fetch(`${normalizedBaseUrl}/images/generations`, {
             method: "POST",
             headers: {
-              Authorization: `Bearer ${body.apiKey.trim()}`,
+              Authorization: `Bearer ${streamBody.apiKey.trim()}`,
               "Content-Type": "application/json",
             },
             body: JSON.stringify(upstreamPayload),
@@ -67,12 +94,31 @@ export async function POST(request: Request) {
           });
 
           if (!response.ok) {
+            await logGenerationEvent({
+              event: "generate_stream_fallback",
+              route: "/api/generate/stream",
+              requestId,
+              timestamp: new Date().toISOString(),
+              durationMs: Date.now() - outerStartedAt,
+              status: response.status,
+              message: `流式接口返回 ${response.status}`,
+              request: body ? summarizeGenerateRequest(body) : undefined,
+            });
             send({ type: "fallback", reason: `流式接口返回 ${response.status}，已切换普通生成。` });
             return;
           }
 
           const contentType = response.headers.get("content-type") ?? "";
           if (!response.body || !contentType.includes("text/event-stream")) {
+            await logGenerationEvent({
+              event: "generate_stream_fallback",
+              route: "/api/generate/stream",
+              requestId,
+              timestamp: new Date().toISOString(),
+              durationMs: Date.now() - outerStartedAt,
+              message: `目标接口返回 ${contentType || "empty content-type"}`,
+              request: body ? summarizeGenerateRequest(body) : undefined,
+            });
             send({ type: "fallback", reason: "目标接口未返回 SSE 流，已切换普通生成。" });
             return;
           }
@@ -81,10 +127,42 @@ export async function POST(request: Request) {
           await relayUpstreamSse(response.body, send, startedAt);
         } catch (error) {
           if (error instanceof Error && error.name === "AbortError") {
+            await logGenerationEvent({
+              event: "generate_error",
+              route: "/api/generate/stream",
+              requestId,
+              timestamp: new Date().toISOString(),
+              durationMs: Date.now() - outerStartedAt,
+              status: 504,
+              code: "upstream_timeout",
+              message: "流式生图请求超时，目标接口未在 600 秒内响应。",
+              request: body ? summarizeGenerateRequest(body) : undefined,
+            });
             send({ type: "error", message: "流式生图请求超时，目标接口未在 600 秒内响应。" });
           } else if (isUserFacingErrorLike(error)) {
+            await logGenerationEvent({
+              event: "generate_error",
+              route: "/api/generate/stream",
+              requestId,
+              timestamp: new Date().toISOString(),
+              durationMs: Date.now() - outerStartedAt,
+              status: error.status,
+              code: error.code,
+              message: error.message,
+              debugSummary: summarizeDebug(error.debug),
+              request: body ? summarizeGenerateRequest(body) : undefined,
+            });
             send({ type: "error", message: error.message ?? "流式生图请求失败。" });
           } else {
+            await logGenerationEvent({
+              event: "generate_stream_fallback",
+              route: "/api/generate/stream",
+              requestId,
+              timestamp: new Date().toISOString(),
+              durationMs: Date.now() - outerStartedAt,
+              message: error instanceof Error ? error.message : "流式生图不可用",
+              request: body ? summarizeGenerateRequest(body) : undefined,
+            });
             send({ type: "fallback", reason: "流式生图不可用，已切换普通生成。" });
           }
         } finally {
@@ -103,9 +181,32 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     if (isUserFacingErrorLike(error)) {
+      await logGenerationEvent({
+        event: "generate_error",
+        route: "/api/generate/stream",
+        requestId,
+        timestamp: new Date().toISOString(),
+        durationMs: Date.now() - outerStartedAt,
+        status: error.status,
+        code: error.code,
+        message: error.message,
+        debugSummary: summarizeDebug(error.debug),
+        request: body ? summarizeGenerateRequest(body) : undefined,
+      });
       return userFacingErrorResponse(error);
     }
 
+    await logGenerationEvent({
+      event: "generate_error",
+      route: "/api/generate/stream",
+      requestId,
+      timestamp: new Date().toISOString(),
+      durationMs: Date.now() - outerStartedAt,
+      status: 500,
+      code: "internal_error",
+      message: error instanceof Error ? error.message : "流式生成请求失败。",
+      request: body ? summarizeGenerateRequest(body) : undefined,
+    });
     return internalErrorResponse("流式生成请求失败。", error);
   }
 }
