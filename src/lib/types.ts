@@ -26,6 +26,7 @@ export type ProbeResult = {
   modelsEndpointWorking: boolean;
   imageModelDetected: boolean;
   recommendedModel: string;
+  availableModels: string[];
   detectedImageModels: string[];
   detectedTextModels: string[];
   capabilities: {

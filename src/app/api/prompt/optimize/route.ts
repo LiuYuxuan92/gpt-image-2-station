@@ -26,11 +26,14 @@ export async function POST(request: Request) {
     };
 
     const textModel =
-      body.textModel?.trim() || body.probe?.detectedTextModels?.[0] || "";
+      body.textModel?.trim() ||
+      body.probe?.detectedTextModels?.[0] ||
+      body.probe?.availableModels?.[0] ||
+      "";
 
     if (!body.aiRewrite || !textModel) {
       if (body.aiRewrite && !textModel) {
-        response.warnings.push("未发现可用文本模型，已自动回退到规则模板优化。");
+        response.warnings.push("未选择可用 AI 改写模型，已自动回退到规则模板优化。");
       }
       return NextResponse.json(response);
     }

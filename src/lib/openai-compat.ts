@@ -220,6 +220,7 @@ export async function probeOpenAICompat(input: {
     modelsEndpointWorking,
     imageModelDetected,
     recommendedModel,
+    availableModels: dedupedModelIds,
     detectedImageModels,
     detectedTextModels,
     capabilities: {
@@ -234,10 +235,12 @@ export async function probeOpenAICompat(input: {
         note: "MVP 按 OpenAI 风格 multipart 编辑接口尝试；是否成功取决于目标站兼容程度。",
       },
       textRewrite: {
-        supported: detectedTextModels.length > 0,
+        supported: detectedTextModels.length > 0 || dedupedModelIds.length > 0,
         note: detectedTextModels.length
           ? `可优先尝试 ${detectedTextModels[0]} 进行 AI 提示词改写。`
-          : "未探测到明确文本模型，将回退到规则模板优化。",
+          : dedupedModelIds.length
+            ? "未按启发式识别出文本模型，但可从探测到的模型列表中手动选择改写模型。"
+            : "未探测到明确文本模型，将回退到规则模板优化。",
       },
     },
     warnings,

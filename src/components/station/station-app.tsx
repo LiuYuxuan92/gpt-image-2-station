@@ -69,6 +69,7 @@ export function StationApp() {
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
   const [apiKey, setApiKey] = useState("");
   const [manualModel, setManualModel] = useState("");
+  const [textRewriteModel, setTextRewriteModel] = useState("");
   const [probeStatus, setProbeStatus] = useState<ProbeStatus>("idle");
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [probeError, setProbeError] = useState<string>("");
@@ -158,6 +159,7 @@ export function StationApp() {
 
       setProbeResult(payload);
       setManualModel((current) => current || payload.recommendedModel);
+      setTextRewriteModel((current) => current || payload.detectedTextModels[0] || payload.availableModels[0] || "");
       setProbeStatus("success");
       setProbeError("");
     } catch (error) {
@@ -189,6 +191,7 @@ export function StationApp() {
           negativePrompt,
           style: promptStyle,
           aiRewrite: useAiRewrite,
+          textModel: textRewriteModel,
           probe: probeResult,
         }),
       });
@@ -650,24 +653,86 @@ export function StationApp() {
                 </Field>
               </div>
               <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                <Field label="手动模型覆盖">
+                <Field label="生图模型">
                   <input
                     value={manualModel}
                     onChange={(event) => setManualModel(event.target.value)}
-                    placeholder="gpt-image-2 或你的中转站别名"
+                    list="available-image-models"
+                    placeholder="gpt-image-2 或从探测列表选择"
                     className={inputClassName}
                   />
+                  <datalist id="available-image-models">
+                    {getAvailableModels(probeResult).map((model) => (
+                      <option key={model} value={model} />
+                    ))}
+                  </datalist>
                 </Field>
+                <Field label="AI 改写模型">
+                  <input
+                    value={textRewriteModel}
+                    onChange={(event) => setTextRewriteModel(event.target.value)}
+                    list="available-text-models"
+                    placeholder="可从任意探测到的模型中选择"
+                    className={inputClassName}
+                  />
+                  <datalist id="available-text-models">
+                    {getAvailableModels(probeResult).map((model) => (
+                      <option key={model} value={model} />
+                    ))}
+                  </datalist>
+                </Field>
+              </div>
+              <div className="mt-3">
                 <Field label="探测结果">
                   <div className="rounded-2xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm text-stone-700">
                     {probeResult ? (
-                      <div className="space-y-1">
-                        <p>标准化地址：{probeResult.normalizedBaseUrl}</p>
-                        <p>模型列表：{probeResult.modelsEndpointWorking ? "可用" : "不可用"}</p>
-                        <p>文本模型：{probeResult.detectedTextModels[0] || "未探测到"}</p>
+                      <div className="space-y-3">
+                        <div className="grid gap-2 sm:grid-cols-3">
+                          <Metric label="标准化地址" value={probeResult.normalizedBaseUrl} />
+                          <Metric label="模型列表" value={probeResult.modelsEndpointWorking ? "可用" : "不可用"} />
+                          <Metric label="模型数量" value={getAvailableModels(probeResult).length} />
+                        </div>
+                        {getAvailableModels(probeResult).length ? (
+                          <div>
+                            <p className="text-xs font-medium uppercase tracking-[0.12em] text-stone-500">
+                              可选模型
+                            </p>
+                            <div className="mt-2 flex max-h-32 flex-wrap gap-2 overflow-y-auto pr-1">
+                              {getAvailableModels(probeResult).map((model) => (
+                                <button
+                                  key={model}
+                                  type="button"
+                                  onClick={() => setManualModel(model)}
+                                  className={cn(
+                                    "rounded-full border px-3 py-1 text-xs font-medium transition",
+                                    manualModel === model
+                                      ? "border-emerald-700 bg-emerald-50 text-emerald-900"
+                                      : "border-stone-200 bg-white text-stone-700 hover:border-stone-300",
+                                  )}
+                                  title="点击设为生图模型"
+                                >
+                                  {model}
+                                </button>
+                              ))}
+                            </div>
+                            <p className="mt-2 text-xs leading-5 text-stone-500">
+                              中转站常把生图能力集成在普通模型名下；这里不强制按“图片/文本”分类，生图和 AI 改写都可以从完整列表里手动选择。
+                            </p>
+                          </div>
+                        ) : null}
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          <Metric
+                            label="启发式图片模型"
+                            value={probeResult.detectedImageModels[0] || "未识别，可手动选择"}
+                          />
+                          <Metric
+                            label="启发式文本模型"
+                            value={probeResult.detectedTextModels[0] || "未识别，可手动选择"}
+                          />
+                        </div>
                       </div>
                     ) : (
-                      <p>尚未探测。若模型列表接口不可用，仍可通过手动模型名继续生成测试。</p>
+                      <p>尚未探测。若模型列表接口不可用，仍可直接填写生图模型或 AI 改写模型继续测试。</p>
                     )}
                   </div>
                 </Field>
@@ -1650,6 +1715,16 @@ function currentTimeMs() {
 
 function isSuccessfulTask(task: HistoryTask): task is SessionTask {
   return task.status !== "error";
+}
+
+function getAvailableModels(probe: ProbeResult | null) {
+  if (!probe) return [];
+  if (probe.availableModels?.length) return probe.availableModels;
+  return [
+    ...probe.detectedImageModels,
+    ...probe.detectedTextModels,
+    ...probe.debug.rawModelIdsSample,
+  ].filter((model, index, array) => model && array.indexOf(model) === index);
 }
 
 const inputClassName =
