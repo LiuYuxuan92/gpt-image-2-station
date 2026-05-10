@@ -1,78 +1,8 @@
 import type { HistoryTask } from "@/lib/types";
 
-const DB_NAME = "gpt-image-2-station";
-const STORE_NAME = "tasks";
-const DB_VERSION = 1;
+import { canUseIndexedDb, HISTORY_STORE_NAME, runLocalStoreTransaction } from "@/lib/local-db";
+
 const DEFAULT_HISTORY_LIMIT = 50;
-
-function canUseIndexedDb() {
-  return typeof window !== "undefined" && "indexedDB" in window && Boolean(window.indexedDB);
-}
-
-function openHistoryDb(): Promise<IDBDatabase | null> {
-  if (!canUseIndexedDb()) return Promise.resolve(null);
-
-  return new Promise((resolve, reject) => {
-    const request = window.indexedDB.open(DB_NAME, DB_VERSION);
-
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        const store = db.createObjectStore(STORE_NAME, { keyPath: "id" });
-        store.createIndex("createdAt", "createdAt");
-      }
-    };
-
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-function closeDb(db: IDBDatabase | null) {
-  db?.close();
-}
-
-function runStoreTransaction<T>(
-  mode: IDBTransactionMode,
-  callback: (store: IDBObjectStore) => IDBRequest<T> | void,
-): Promise<T | undefined> {
-  return openHistoryDb().then(
-    (db) =>
-      new Promise<T | undefined>((resolve, reject) => {
-        if (!db) {
-          resolve(undefined);
-          return;
-        }
-
-        const transaction = db.transaction(STORE_NAME, mode);
-        const store = transaction.objectStore(STORE_NAME);
-        const request = callback(store);
-        let result: T | undefined;
-
-        if (request) {
-          request.onsuccess = () => {
-            result = request.result;
-          };
-          request.onerror = () => {
-            reject(request.error);
-          };
-        }
-
-        transaction.oncomplete = () => {
-          closeDb(db);
-          resolve(result);
-        };
-        transaction.onerror = () => {
-          closeDb(db);
-          reject(transaction.error);
-        };
-        transaction.onabort = () => {
-          closeDb(db);
-          reject(transaction.error);
-        };
-      }),
-  );
-}
 
 function sortNewestFirst(tasks: HistoryTask[]) {
   return tasks.sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
@@ -127,7 +57,11 @@ async function trimHistoryTasks(limit: number) {
   const tasks = await loadHistoryTasks(Number.isFinite(limit) ? limit : DEFAULT_HISTORY_LIMIT);
   const keepIds = new Set(tasks.map((task) => task.id));
   const allTasks =
-    (await runStoreTransaction<HistoryTask[]>("readonly", (store) => store.getAll())) ?? [];
+    (await runLocalStoreTransaction<HistoryTask[]>(
+      HISTORY_STORE_NAME,
+      "readonly",
+      (store) => store.getAll(),
+    )) ?? [];
   const staleTasks = allTasks.filter((task) => !keepIds.has(task.id));
 
   await Promise.all(staleTasks.map((task) => deleteHistoryTask(task.id)));
@@ -137,7 +71,11 @@ export async function loadHistoryTasks(limit = DEFAULT_HISTORY_LIMIT): Promise<H
   if (!canUseIndexedDb()) return [];
 
   const tasks =
-    (await runStoreTransaction<HistoryTask[]>("readonly", (store) => store.getAll())) ?? [];
+    (await runLocalStoreTransaction<HistoryTask[]>(
+      HISTORY_STORE_NAME,
+      "readonly",
+      (store) => store.getAll(),
+    )) ?? [];
   const safeLimit = Math.max(0, limit);
   return sortNewestFirst(tasks).slice(0, safeLimit);
 }
@@ -145,18 +83,30 @@ export async function loadHistoryTasks(limit = DEFAULT_HISTORY_LIMIT): Promise<H
 export async function saveHistoryTask(task: HistoryTask, limit = DEFAULT_HISTORY_LIMIT) {
   if (!canUseIndexedDb()) return;
 
-  await runStoreTransaction<IDBValidKey>("readwrite", (store) => store.put(sanitizeHistoryTask(task)));
+  await runLocalStoreTransaction<IDBValidKey>(
+    HISTORY_STORE_NAME,
+    "readwrite",
+    (store) => store.put(sanitizeHistoryTask(task)),
+  );
   await trimHistoryTasks(Math.max(0, limit));
 }
 
 export async function deleteHistoryTask(id: string) {
   if (!canUseIndexedDb()) return;
 
-  await runStoreTransaction<undefined>("readwrite", (store) => store.delete(id));
+  await runLocalStoreTransaction<undefined>(
+    HISTORY_STORE_NAME,
+    "readwrite",
+    (store) => store.delete(id),
+  );
 }
 
 export async function clearHistoryTasks() {
   if (!canUseIndexedDb()) return;
 
-  await runStoreTransaction<undefined>("readwrite", (store) => store.clear());
+  await runLocalStoreTransaction<undefined>(
+    HISTORY_STORE_NAME,
+    "readwrite",
+    (store) => store.clear(),
+  );
 }

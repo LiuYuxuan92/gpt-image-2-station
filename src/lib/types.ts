@@ -155,3 +155,27 @@ export type FailedSessionTask = Omit<SessionTask, "response" | "status"> & {
 };
 
 export type HistoryTask = SessionTask | FailedSessionTask;
+
+export type SavedStationConfig = {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  baseUrl: string;
+  apiKey?: string;
+  model: string;
+  textRewriteModel: string;
+  quality: string;
+  size: string;
+  customWidth: string;
+  customHeight: string;
+  n: number;
+  outputFormat: OutputFormat;
+  background: string;
+  styleHint: string;
+  seed: string;
+  useStreaming: boolean;
+  partialImages: number;
+  promptStyle: PromptStyle;
+  useAiRewrite: boolean;
+};

@@ -36,6 +36,9 @@ pnpm start
 - `src/app/api/generate/route.ts`：图像生成 API。
 - `src/lib/openai-compat.ts`：OpenAI 兼容层、Base URL 归一化、SSRF 防护、请求代理、响应归一化。
 - `src/lib/prompt-optimizer.ts`：规则提示词优化与 AI 改写指令构建。
+- `src/lib/history-store.ts`：IndexedDB 历史任务存储。
+- `src/lib/config-store.ts`：IndexedDB 本地配置存储。
+- `src/lib/local-db.ts`：IndexedDB 版本、表结构和通用事务工具。
 - `src/lib/types.ts`：前后端共享类型。
 - `src/lib/utils.ts`：通用工具函数。
 - `docs/architecture.md`：架构说明和 MVP 边界。
@@ -56,7 +59,9 @@ pnpm start
 
 ## 安全和隐私约定
 
-- API Key 只能保存在浏览器会话状态中，不落库、不写日志、不进入历史记录。
+- API Key 默认只能保存在浏览器会话状态中，不写日志、不进入历史记录。
+- 只有用户明确勾选“同时保存 API Key 到本机”时，配置库才允许把 API Key 写入当前浏览器 IndexedDB。
+- 应用未保存 Key 的配置时，应清空当前 API Key，避免沿用其他中转站的旧密钥。
 - 生成历史保存在浏览器 IndexedDB，且 `HistoryTask` 不包含 API Key、原始参考图数据或遮罩 dataUrl。
 - 默认禁止访问 localhost、loopback 和常见内网地址，除非服务端显式设置 `ALLOW_PRIVATE_BASE_URLS=true`。
 - 只允许 `http:` 和 `https:` Base URL。
@@ -78,6 +83,12 @@ pnpm start
 - AI 改写失败时应回退到规则模板，并把原因作为 warning 返回，而不是让整个优化流程失败。
 - 中文原始提示词默认输出中文优化结果；英文提示词默认输出英文优化结果。
 - 不改变用户核心意图，只补充结构、构图、光线、材质、背景和避免内容。
+
+## 本地配置约定
+
+- 配置库只使用当前浏览器 IndexedDB，不引入服务端持久化。
+- 配置应包含 Base URL、生图模型、AI 改写模型和生成参数；默认不包含 API Key。
+- 配置应支持保存当前、编辑覆盖、另存为新配置和删除。
 
 ## 验证要求
 
@@ -109,6 +120,7 @@ pnpm dev
 - 流式预览不兼容时的普通生成回退。
 - 遮罩画笔导出后作为 mask 参与参考图请求。
 - 成功结果进入会话历史，历史不包含 API Key。
+- 本地配置保存、应用、编辑覆盖、另存为新和删除。
 
 ## 开发注意事项
 

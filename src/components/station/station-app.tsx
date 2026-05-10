@@ -3,6 +3,11 @@
 import { useEffect, useRef, useState } from "react";
 
 import {
+  deleteSavedConfig,
+  loadSavedConfigs,
+  saveStationConfig,
+} from "@/lib/config-store";
+import {
   clearHistoryTasks,
   loadHistoryTasks,
   saveHistoryTask,
@@ -17,9 +22,10 @@ import type {
   PromptOptimizeResponse,
   PromptStyle,
   ReferenceImageInput,
+  SavedStationConfig,
   SessionTask,
 } from "@/lib/types";
-import { cn, formatBytes, makeTaskLabel } from "@/lib/utils";
+import { cn, formatBytes, makeTaskLabel, maskSecret } from "@/lib/utils";
 
 const HISTORY_LIMIT = 50;
 const MAX_REFERENCE_IMAGES = 4;
@@ -70,6 +76,13 @@ export function StationApp() {
   const [apiKey, setApiKey] = useState("");
   const [manualModel, setManualModel] = useState("");
   const [textRewriteModel, setTextRewriteModel] = useState("");
+  const [savedConfigs, setSavedConfigs] = useState<SavedStationConfig[]>([]);
+  const [configsReady, setConfigsReady] = useState(false);
+  const [editingConfigId, setEditingConfigId] = useState<string | null>(null);
+  const [configName, setConfigName] = useState("");
+  const [saveApiKey, setSaveApiKey] = useState(false);
+  const [configNotice, setConfigNotice] = useState("");
+  const [configError, setConfigError] = useState("");
   const [probeStatus, setProbeStatus] = useState<ProbeStatus>("idle");
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [probeError, setProbeError] = useState<string>("");
@@ -115,6 +128,20 @@ export function StationApp() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const maskInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    loadSavedConfigs()
+      .then((configs) => {
+        if (active) setSavedConfigs(configs);
+      })
+      .finally(() => {
+        if (active) setConfigsReady(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -166,6 +193,108 @@ export function StationApp() {
       setProbeStatus("error");
       setProbeError(error instanceof Error ? error.message : "连接探测失败。");
     }
+  }
+
+  function buildConfigSnapshot(options?: { forceNew?: boolean }): SavedStationConfig {
+    const now = new Date().toISOString();
+    const existing = !options?.forceNew && editingConfigId
+      ? savedConfigs.find((config) => config.id === editingConfigId)
+      : null;
+    const name = configName.trim() || makeDefaultConfigName(baseUrl, manualModel);
+
+    return {
+      id: existing?.id ?? crypto.randomUUID(),
+      name,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      baseUrl,
+      apiKey: saveApiKey ? apiKey : undefined,
+      model: manualModel,
+      textRewriteModel,
+      quality,
+      size,
+      customWidth,
+      customHeight,
+      n: count,
+      outputFormat,
+      background,
+      styleHint,
+      seed,
+      useStreaming,
+      partialImages,
+      promptStyle,
+      useAiRewrite,
+    };
+  }
+
+  async function refreshSavedConfigs() {
+    setSavedConfigs(await loadSavedConfigs());
+  }
+
+  async function handleSaveConfig(forceNew = false) {
+    setConfigError("");
+    setConfigNotice("");
+
+    if (!baseUrl.trim()) {
+      setConfigError("Base URL 不能为空。");
+      return;
+    }
+
+    const config = buildConfigSnapshot({ forceNew });
+    await saveStationConfig(config);
+    setEditingConfigId(config.id);
+    setConfigName(config.name);
+    setSaveApiKey(Boolean(config.apiKey));
+    await refreshSavedConfigs();
+    setConfigNotice(forceNew ? "已另存为新配置。" : "配置已保存。");
+  }
+
+  function applySavedConfig(config: SavedStationConfig, mode: "use" | "edit") {
+    setBaseUrl(config.baseUrl);
+    setApiKey(config.apiKey ?? "");
+    setManualModel(config.model);
+    setTextRewriteModel(config.textRewriteModel);
+    setQuality(config.quality);
+    setSize(config.size);
+    setCustomWidth(config.customWidth);
+    setCustomHeight(config.customHeight);
+    setCount(config.n);
+    setOutputFormat(config.outputFormat);
+    setBackground(config.background);
+    setStyleHint(config.styleHint);
+    setSeed(config.seed);
+    setUseStreaming(config.useStreaming);
+    setPartialImages(config.partialImages);
+    setPromptStyle(config.promptStyle);
+    setUseAiRewrite(config.useAiRewrite);
+    setEditingConfigId(mode === "edit" ? config.id : null);
+    setConfigName(mode === "edit" ? config.name : "");
+    setSaveApiKey(Boolean(config.apiKey));
+    setProbeResult(null);
+    setProbeStatus("idle");
+    setProbeError("");
+    setConfigError("");
+    setConfigNotice(mode === "edit" ? `正在编辑：${config.name}` : `已应用配置：${config.name}`);
+  }
+
+  async function handleDeleteConfig(id: string) {
+    await deleteSavedConfig(id);
+    if (editingConfigId === id) {
+      setEditingConfigId(null);
+      setConfigName("");
+      setSaveApiKey(false);
+    }
+    await refreshSavedConfigs();
+    setConfigError("");
+    setConfigNotice("配置已删除。");
+  }
+
+  function clearConfigEditing() {
+    setEditingConfigId(null);
+    setConfigName("");
+    setSaveApiKey(false);
+    setConfigError("");
+    setConfigNotice("");
   }
 
   async function handleOptimize() {
@@ -621,7 +750,7 @@ export function StationApp() {
           <div className="space-y-4">
             <Panel
               title="连接配置"
-              subtitle="Base URL 和 API Key 只保存在当前浏览器会话。"
+              subtitle="Base URL 和模型可保存为本地配置；API Key 默认不保存。"
               aside={
                 <button
                   type="button"
@@ -741,6 +870,129 @@ export function StationApp() {
               {probeResult?.warnings?.length ? (
                 <NoticeList title="兼容性提示" items={probeResult.warnings} tone="amber" />
               ) : null}
+            </Panel>
+
+            <Panel
+              title="本地配置库"
+              subtitle="保存常用中转站、模型和生成参数。配置仅写入当前浏览器 IndexedDB。"
+              aside={
+                editingConfigId ? (
+                  <button
+                    type="button"
+                    onClick={clearConfigEditing}
+                    className="rounded-full border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 transition hover:bg-white"
+                  >
+                    退出编辑
+                  </button>
+                ) : null
+              }
+            >
+              <div className="grid gap-3 lg:grid-cols-[1fr_auto]">
+                <Field label="配置名称">
+                  <input
+                    value={configName}
+                    onChange={(event) => setConfigName(event.target.value)}
+                    placeholder={makeDefaultConfigName(baseUrl, manualModel)}
+                    className={inputClassName}
+                  />
+                </Field>
+                <div className="flex flex-col justify-end gap-2 sm:flex-row lg:flex-col">
+                  <button
+                    type="button"
+                    onClick={() => handleSaveConfig(false)}
+                    className="rounded-2xl bg-emerald-900 px-4 py-3 text-sm font-medium text-white transition hover:bg-emerald-800"
+                  >
+                    {editingConfigId ? "保存修改" : "保存当前配置"}
+                  </button>
+                  {editingConfigId ? (
+                    <button
+                      type="button"
+                      onClick={() => handleSaveConfig(true)}
+                      className="rounded-2xl border border-stone-300 px-4 py-3 text-sm font-medium text-stone-800 transition hover:bg-white"
+                    >
+                      另存为新配置
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+
+              <label className="mt-3 flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+                <input
+                  type="checkbox"
+                  checked={saveApiKey}
+                  onChange={(event) => setSaveApiKey(event.target.checked)}
+                  className="mt-1 size-4 rounded border-amber-400"
+                />
+                <span>
+                  <span className="block font-medium">同时保存 API Key 到本机</span>
+                  <span className="mt-1 block leading-5">
+                    默认关闭。开启后只保存在当前浏览器 IndexedDB，不会提交到仓库或发送给其他服务。
+                  </span>
+                </span>
+              </label>
+
+              {configError ? <ErrorNotice message={configError} /> : null}
+              {configNotice ? <NoticeList title="配置提示" items={[configNotice]} tone="sky" /> : null}
+
+              <div className="mt-4 space-y-3">
+                {savedConfigs.length ? (
+                  savedConfigs.map((config) => (
+                    <div
+                      key={config.id}
+                      className={cn(
+                        "rounded-2xl border bg-stone-50 px-4 py-4",
+                        editingConfigId === config.id ? "border-emerald-300 ring-2 ring-emerald-100" : "border-stone-200",
+                      )}
+                    >
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="truncate text-sm font-semibold text-stone-900">{config.name}</h3>
+                            {config.apiKey ? <Pill label={`Key ${maskSecret(config.apiKey)}`} /> : <Pill label="未存 Key" />}
+                          </div>
+                          <p className="mt-2 break-all text-xs leading-5 text-stone-600">{config.baseUrl}</p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            <Pill label={`生图 ${config.model || "未填"}`} />
+                            {config.textRewriteModel ? <Pill label={`改写 ${config.textRewriteModel}`} /> : null}
+                            <Pill label={`${config.size} / ${config.quality}`} />
+                            <Pill label={config.outputFormat} />
+                          </div>
+                          <p className="mt-2 text-xs text-stone-500">
+                            更新于 {new Date(config.updatedAt).toLocaleString()}
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => applySavedConfig(config, "use")}
+                            className="rounded-full bg-stone-900 px-3 py-2 text-xs font-medium text-white"
+                          >
+                            应用
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => applySavedConfig(config, "edit")}
+                            className="rounded-full border border-stone-300 bg-white px-3 py-2 text-xs font-medium text-stone-700"
+                          >
+                            编辑
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteConfig(config.id)}
+                            className="rounded-full border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700"
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                ) : !configsReady ? (
+                  <EmptyState title="正在读取配置" description="正在从浏览器 IndexedDB 加载本地配置。" />
+                ) : (
+                  <EmptyState title="暂无保存配置" description="填好连接和参数后保存，后面可以一键应用或继续编辑。" />
+                )}
+              </div>
             </Panel>
 
             <Panel
@@ -1715,6 +1967,19 @@ function currentTimeMs() {
 
 function isSuccessfulTask(task: HistoryTask): task is SessionTask {
   return task.status !== "error";
+}
+
+function makeDefaultConfigName(baseUrl: string, model: string) {
+  const host = safeHostName(baseUrl) || "custom";
+  return `${host} / ${model.trim() || "未指定模型"}`;
+}
+
+function safeHostName(value: string) {
+  try {
+    return new URL(value.trim()).hostname;
+  } catch {
+    return value.trim().replace(/^https?:\/\//, "").split("/")[0] || "";
+  }
 }
 
 function getAvailableModels(probe: ProbeResult | null) {
